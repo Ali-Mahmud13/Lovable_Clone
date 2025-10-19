@@ -1,15 +1,20 @@
 import { inngest } from "./client";
 import {Sandbox} from "@e2b/code-interpreter"
-import { createAgent, openai, createTool, createNetwork, Agent } from "@inngest/agent-kit";
+import { createAgent, openai, createTool, createNetwork, type Tool } from "@inngest/agent-kit";
 import { getSandbox, lastAssistantTextMessageContent } from "./utils";
 import { z } from "zod";
 import { PROMPT } from "@/prompt";
+import { prisma } from "@/lib/database";
 
 
 
-export const helloWorld = inngest.createFunction(
- { id: "hello-world" },
- { event: "test/hello.world" },
+interface AgentState{
+  summary: string;
+  files: {[path: string]: string};
+}
+export const codeAgentFunction = inngest.createFunction(
+ { id: "code-agent" },
+ { event: "code-agent/run" },
  async ({ event, step }) => {
   //getting sanbox id for the template we created
   const sanboxID= await step.run("get-sandbox-id", async ()=>{
@@ -17,11 +22,11 @@ export const helloWorld = inngest.createFunction(
     return sandbox.sandboxId;
   });
   
-   const codeAgent = createAgent({
+   const codeAgent = createAgent<AgentState>({
  name: 'Code Agent',
  description:"An expert coding agent",
  system: PROMPT,
- model: openai({model:'gpt-4.1',
+ model: openai({model:'gpt-4o',
   defaultParameters:{ temperature:0.1}
  }), // Use GPT-4 for higher quality output
  tools: [
@@ -62,7 +67,8 @@ export const helloWorld = inngest.createFunction(
       }),
       ),
     }),
-    handler: async ({files}, {step,network})=>{
+    handler: async ({files}, {step,network}:Tool.Options<AgentState>
+    )=>{
       const newFiles=await step?.run("CreateOrUpdateFiles", async ()=>{
         try{
           const updatedFiles= network.state.data.files || {};
@@ -122,7 +128,7 @@ lifecycle: {onResponse: async({result,network})=>{
 }}
 
 });
-const network=createNetwork({
+const network=createNetwork<AgentState>({
   name: "coding-agent-network",
   agents: [codeAgent],
   maxIter: 15, //limit how may loops agent can do
@@ -137,12 +143,40 @@ const network=createNetwork({
 
 });
 const result= await network.run(event.data.value);
+const isError=!result.state.data.summary ||
+Object.keys(result.state.data.files || {}).length===0;
 
 //getting sandbox url to run the code
 const sandboxURL=await step.run("get-sandbox-url", async ()=>{
   const sandbox= await getSandbox(sanboxID);
   const host= sandbox.getHost(3000); //creates a port under the host 3000
   return `https://${host}`;
+
+});
+await step.run("save-results", async ()=>{
+  if(isError){
+    return await prisma.message.create({
+      data:{
+        content: "Something went wrong while running the agent.",
+        role: "ASSISTANT",
+        type: "ERROR",
+      }
+    })
+  }
+  return await prisma.message.create({
+    data:{
+      content: result.state.data.summary,
+      role: "ASSISTANT",
+      type: "RESULT",
+      fragments:{
+        create:{
+          SandboxUrl: sandboxURL,
+          title: "Fragment",
+          files: result.state.data.files,
+        }
+      }
+    }
+  })
 
 });
     return { 
